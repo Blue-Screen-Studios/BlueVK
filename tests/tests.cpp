@@ -40,7 +40,7 @@ void testFeatureChain() {
 }
 
 void testContext(bvk::Ctx& ctx) {
-  expect(ctx.dev && ctx.queue && ctx.vma && ctx.cmd && ctx.fence && !ctx.surface && !ctx.swapchain,
+  expect(ctx.dev && ctx.queue && ctx.vma && ctx.cmd() && ctx.fence() && !ctx.surface && !ctx.swapchain,
          "headless: a device, no surface or swapchain");
   expect(!ctx.gpu.name.empty() && !ctx.gpu.api.empty(), "the GPU described");
   expect(ctx.hasExtension("VK_none_such") == false, "an extension not asked for isn't enabled");
@@ -125,7 +125,7 @@ int main() {
     if (level >= bvk::LogLevel::Warn) std::printf("      [bluevk] %.*s\n", int(msg.size()), msg.data());
   });
 
-  bvk::ContextDesc desc;
+  bvk::Config desc;
   desc.appName = "BlueVK tests";
   desc.descriptorPool = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
   desc.descriptorSets = 4;
@@ -140,8 +140,7 @@ int main() {
     return true;
   };
   bvk::Ctx ctx;
-  if (!bvk::createContext(ctx, nullptr, desc)) {
-    bvk::destroyContext(ctx);
+  if (bvk::createContext(ctx, nullptr, desc) != bvk::ContextResult::Ok) {
     std::printf("skip  no Vulkan 1.3 GPU\n");
     return failures ? 1 : 77;
   }

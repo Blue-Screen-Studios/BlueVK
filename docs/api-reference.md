@@ -20,7 +20,11 @@ Everything is in namespace `bvk`. `<bluevk/bluevk.hpp>` includes both headers.
 | `DeviceCandidate` | A GPU being considered: `phys`, `props`, `memory`, `vramBytes`, `supported`, `extensions`, `apiVersion`; `hasExtension(name)`, `features<T>(sType)`, `properties<T>(sType)`. |
 | `DeviceChoice` | What to enable: `enable`, `extensions`, `score`; `add<T>(sType)` chains in an extension's feature struct. |
 | `DevicePicker` | `bool(const DeviceCandidate&, DeviceChoice&, std::string& why)` |
-| `ContextDesc` | `appName`, `appVersion`, `apiVersion` (default 1.3), `computeQueue` (default true), `validation` (default on without `NDEBUG`), `pick`, `descriptorPool` + `descriptorSets` (a shared pool whose sets can be freed; empty: no pool). |
+| `Config` | `appName` (`std::string`), `appVersion`, `apiVersion` (default 1.3), `buffering`, `gpu`, `computeQueue` (default true), `validation` (default on without `NDEBUG`), `requiredFeatures`, `requiredExtensions`, `pick`, `descriptorPool` + `descriptorSets` (a shared pool whose sets can be freed; empty: no pool). See [Integration](integration.md#configuring-the-context). |
+| `Buffering` | `Single`, `Double`, `Triple`: frames in flight (1 to 3). |
+| `GpuTarget` | `Any`, `RequireDiscrete`, `PreferDiscrete`. |
+| `ContextResult` | `Ok`, or why the config couldn't be met: `InvalidConfig`, `VulkanUnavailable`, `InstanceFailed`, `SurfaceFailed`, `NoGpu`, `NoDiscreteGpu`, `ApiVersionUnsupported`, `NoSuitableQueue`, `CannotPresent`, `MissingExtension`, `MissingFeature`, `BufferingUnsupported`, `RejectedByPicker`, `DeviceFailed`, `ResourceFailed`, `SwapchainFailed`. `toString(ContextResult)` describes it. |
+| `kEngineName`, `kEngineVersion` | `"IBX_BlueVK"` and BlueVK's version, given to Vulkan for every application. |
 | `GpuInfo` | `name`, `type`, `api`, `driver`, `vramBytes`, `validation`. |
 
 ### `Ctx`
@@ -30,13 +34,13 @@ Everything is in namespace `bvk`. `<bluevk/bluevk.hpp>` includes both headers.
 | Device | `inst`, `debugMessenger`, `surface`, `phys`, `dev`, `qf`, `queue`, `vma`, `descPool`, `apiVersion`, `props`, `timestampPeriod` (ns per tick), `subgroupSize`, `gpu`, `enabled`, `extensions`, `hasExtension(name)` |
 | Swapchain settings (read when it's built) | `vsync` (true: FIFO; false: IMMEDIATE where available), `surfaceFormats` (in order of preference; default B8G8R8A8_SRGB / sRGB nonlinear), `swapchainUsage` (default COLOR_ATTACHMENT) |
 | Swapchain | `swapchain`, `colorFmt`, `colorSpace`, `swapExtent`, `colorImgs`, `colorViews`, `windowW`, `windowH` |
-| Frame | `pool` (resettable buffers), `cmd`, `acquire`, `present[]` (one per swapchain image), `fence` (made signalled), `image` |
+| Frame | `pool` (resettable buffers), `framesInFlight` (from `Config::buffering`, at most `kMaxFramesInFlight`), `frame` (the one being recorded), `cmd()`, `acquire()`, `fence()` (made signalled; the current frame's, from `cmds[]`, `acquires[]`, `fences[]`), `present[]` (one per swapchain image), `image`; `advanceFrame(Ctx&)` moves on to the next frame |
 
 ### Functions
 
 | | |
 |---|---|
-| `bool createContext(Ctx&, SDL_Window* win, const ContextDesc&)` | Everything above. `win` null: headless (no surface, no swapchain). |
+| `ContextResult createContext(Ctx&, SDL_Window* win, const Config&, std::string* detail = nullptr)` | Everything above, on the best GPU that meets the config. `win` null: headless (no surface, no swapchain). Not `Ok`: the reason (logged, `detail` its particulars) and the `Ctx` destroyed. |
 | `Swapchain ensureSwapchain(Ctx&, SDL_Window*, bool force = false)` | Rebuilds the swapchain if the window's size changed, or if `force`. Returns `Unchanged`, `Rebuilt` (the game rebuilds its framebuffers) or `Failed`. |
 | `void destroyContext(Ctx&)` | Waits for the GPU, destroys what `createContext` made and resets the `Ctx`. |
 | `struct Buffer { b, alloc, size, mapped }` | |

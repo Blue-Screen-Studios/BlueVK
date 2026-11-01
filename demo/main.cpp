@@ -28,15 +28,18 @@ void createFramebuffers(DemoCtx& c) {
 
 // One frame: acquire, clear, present. False: the swapchain is out of date.
 bool drawFrame(DemoCtx& c, float t) {
-  vkWaitForFences(c.dev, 1, &c.fence, VK_TRUE, UINT64_MAX);
-  VkResult r = vkAcquireNextImageKHR(c.dev, c.swapchain, UINT64_MAX, c.acquire, VK_NULL_HANDLE, &c.image);
+  const VkFence fence = c.fence();
+  const VkCommandBuffer cmd = c.cmd();
+  const VkSemaphore acquire = c.acquire();
+  vkWaitForFences(c.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+  VkResult r = vkAcquireNextImageKHR(c.dev, c.swapchain, UINT64_MAX, acquire, VK_NULL_HANDLE, &c.image);
   if (r == VK_ERROR_OUT_OF_DATE_KHR) return false;
-  vkResetFences(c.dev, 1, &c.fence);
+  vkResetFences(c.dev, 1, &fence);
 
-  vkResetCommandBuffer(c.cmd, 0);
+  vkResetCommandBuffer(cmd, 0);
   auto bi = bvk::vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(c.cmd, &bi);
+  vkBeginCommandBuffer(cmd, &bi);
   VkClearValue clear{};
   clear.color = {{0.1f + 0.1f * std::sin(t), 0.25f + 0.1f * std::sin(t * 0.7f + 2.0f), 0.5f, 1.0f}};
   auto rbi = bvk::vkStruct<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
@@ -45,20 +48,20 @@ bool drawFrame(DemoCtx& c, float t) {
   rbi.renderArea.extent = c.swapExtent;
   rbi.clearValueCount = 1;
   rbi.pClearValues = &clear;
-  vkCmdBeginRenderPass(c.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-  vkCmdEndRenderPass(c.cmd);
-  vkEndCommandBuffer(c.cmd);
+  vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdEndRenderPass(cmd);
+  vkEndCommandBuffer(cmd);
 
   const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   auto si = bvk::vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
   si.waitSemaphoreCount = 1;
-  si.pWaitSemaphores = &c.acquire;
+  si.pWaitSemaphores = &acquire;
   si.pWaitDstStageMask = &wait;
   si.commandBufferCount = 1;
-  si.pCommandBuffers = &c.cmd;
+  si.pCommandBuffers = &cmd;
   si.signalSemaphoreCount = 1;
   si.pSignalSemaphores = &c.present[c.image];
-  vkQueueSubmit(c.queue, 1, &si, c.fence);
+  vkQueueSubmit(c.queue, 1, &si, fence);
 
   auto pi = bvk::vkStruct<VkPresentInfoKHR>(VK_STRUCTURE_TYPE_PRESENT_INFO_KHR);
   pi.waitSemaphoreCount = 1;
@@ -67,6 +70,7 @@ bool drawFrame(DemoCtx& c, float t) {
   pi.pSwapchains = &c.swapchain;
   pi.pImageIndices = &c.image;
   r = vkQueuePresentKHR(c.queue, &pi);
+  bvk::advanceFrame(c);
   return r != VK_ERROR_OUT_OF_DATE_KHR && r != VK_SUBOPTIMAL_KHR;
 }
 
@@ -79,10 +83,10 @@ int main() {
   }
   SDL_Window* win = SDL_CreateWindow("BlueVK demo", 960, 540, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
   DemoCtx c;
-  bvk::ContextDesc desc;
+  bvk::Config desc;
   desc.appName = "BlueVK demo";
   desc.computeQueue = false;
-  if (!win || !bvk::createContext(c, win, desc)) return 1;
+  if (!win || bvk::createContext(c, win, desc) != bvk::ContextResult::Ok) return 1;
 
   c.presentPass = bvk::makeRenderPass(
       c,

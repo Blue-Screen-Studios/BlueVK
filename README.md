@@ -12,7 +12,7 @@ BlueVK draws nothing and holds no render targets. The game derives its own conte
 | Picks the GPU: discrete first, then the most VRAM | Creates its render passes, targets and pipelines |
 | Device, queue, VMA allocator, optional shared descriptor pool | Records and submits its frames |
 | Swapchain, rebuilt when the window resizes | Rebuilds its framebuffers when the swapchain is rebuilt |
-| Command buffer, acquire/present semaphores, frame fence | Routes BlueVK's log messages into its own logger (optional) |
+| Per frame in flight: command buffer, acquire semaphore, fence; present semaphores | Routes BlueVK's log messages into its own logger (optional) |
 
 Used by FloodSim and Hexoid.
 
@@ -26,20 +26,19 @@ struct GameCtx : bvk::Ctx {  // BlueVK's context plus the game's own
   std::vector<VkFramebuffer> presentFbs;
 };
 
-bvk::ContextDesc desc;
-desc.appName = "My Game";
-desc.pick = [](const bvk::DeviceCandidate& gpu, bvk::DeviceChoice& use, std::string& why) {
-  if (!gpu.supported.core.features.independentBlend) {
-    why = "no independent blending";  // logged; this GPU is passed over
-    return false;
-  }
-  use.enable.core.features.independentBlend = VK_TRUE;
-  use.enable.v13.shaderDemoteToHelperInvocation = VK_TRUE;
-  return true;
-};
+bvk::Config config;
+config.appName = "My Game";                       // the engine is always "IBX_BlueVK"
+config.buffering = bvk::Buffering::Double;        // two frames in flight
+config.gpu = bvk::GpuTarget::PreferDiscrete;      // or Any, RequireDiscrete
+config.requiredFeatures.core.features.independentBlend = VK_TRUE;  // passed over without it
+config.requiredExtensions = {VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME};
 
 GameCtx ctx;
-if (!bvk::createContext(ctx, window, desc)) return false;  // window: SDL_WINDOW_VULKAN
+std::string why;
+if (bvk::ContextResult r = bvk::createContext(ctx, window, config, &why); r != bvk::ContextResult::Ok) {
+  showError(bvk::toString(r), why);  // e.g. "a required feature is missing", "Intel UHD 620: no independentBlend"
+  return false;
+}
 // ... make presentPass and presentFbs from ctx.colorViews ...
 
 // Every frame:
@@ -48,8 +47,8 @@ switch (bvk::ensureSwapchain(ctx, window)) {
   case bvk::Swapchain::Failed: return false;
   case bvk::Swapchain::Unchanged: break;
 }
-// wait ctx.fence, acquire into ctx.image (signals ctx.acquire), record ctx.cmd,
-// submit (signals ctx.present[ctx.image]), present.
+// wait ctx.fence(), acquire into ctx.image (signals ctx.acquire()), record
+// ctx.cmd(), submit (signals ctx.present[ctx.image]), present, advanceFrame.
 
 // At the end: the game's own objects first, then
 bvk::destroyContext(ctx);

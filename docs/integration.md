@@ -35,10 +35,11 @@ struct Ctx : bvk::Ctx {
 };
 
 bool createCtx(Ctx& c, SDL_Window* win) {
-  ContextDesc desc;
-  desc.appName = "Game";
-  desc.pick = pickDevice;
-  if (!createContext(c, win, desc)) return false;
+  Config config;
+  config.appName = "Game";
+  config.buffering = Buffering::Double;
+  config.pick = pickDevice;
+  if (createContext(c, win, config) != ContextResult::Ok) return false;
   c.extent = c.swapExtent;
   createRenderPasses(c);
   return createRenderTargets(c);
@@ -64,26 +65,70 @@ void destroyCtx(Ctx& c) {
 
 FloodSim's and Hexoid's `src/vkctx.cpp` are both written this way.
 
+## Configuring the context
+
+Everything the context should be goes in one `bvk::Config`:
+
+| Field | Default | |
+|---|---|---|
+| `appName` | `"BlueVK App"` | The application name given to Vulkan. The engine name is always `"IBX_BlueVK"` (`bvk::kEngineName`). |
+| `appVersion` | 0.1.0 | |
+| `apiVersion` | 1.3 | GPUs below it are passed over. |
+| `buffering` | `Buffering::Single` | `Single`, `Double` or `Triple`: the frames in flight (`ctx.framesInFlight`). The swapchain gets at least that many images. |
+| `gpu` | `GpuTarget::PreferDiscrete` | `Any` (any GPU, ranked by VRAM), `RequireDiscrete` (only discrete GPUs) or `PreferDiscrete` (discrete ahead of the rest). Software renderers always rank last. |
+| `computeQueue` | true | The one queue does compute too. |
+| `validation` | on without `NDEBUG` | `VK_LAYER_KHRONOS_validation`, when installed. |
+| `requiredFeatures` | none | Any feature set here (`core.features`, `v11`, `v12`, `v13`) must be supported, and is enabled. |
+| `requiredExtensions` | none | Device extensions that must be supported, and are enabled. |
+| `pick` | none | The game's own look at each GPU that meets the rest (below). |
+| `descriptorPool`, `descriptorSets` | none | A shared descriptor pool whose sets can be freed. |
+
+`createContext(ctx, window, config, &detail)` returns `ContextResult::Ok`, or why the config couldn't be met. On failure the reason is logged, `detail` (optional) gets the particulars, such as which GPU lacked which feature, and the context is destroyed so it can be tried again with a different config. `toString(result)` gives a short description.
+
+| `ContextResult` | |
+|---|---|
+| `InvalidConfig` | The config itself is wrong: required features above its `apiVersion`. |
+| `VulkanUnavailable` | No Vulkan driver or loader, or none for the window system. |
+| `InstanceFailed` | `vkCreateInstance` failed for another reason. |
+| `SurfaceFailed` | The window's surface couldn't be made. |
+| `NoGpu` | No GPU at all. |
+| `NoDiscreteGpu` | `RequireDiscrete`, and no GPU is discrete. |
+| `ApiVersionUnsupported` | No GPU has `apiVersion`. |
+| `NoSuitableQueue` | No queue for graphics (plus compute, plus presenting). |
+| `CannotPresent` | No GPU can present to the window. |
+| `MissingExtension` | A required extension is missing. |
+| `MissingFeature` | A required feature is missing. |
+| `BufferingUnsupported` | The window's swapchain can't hold as many images as the buffering. |
+| `RejectedByPicker` | `pick` turned down every GPU left. |
+| `DeviceFailed` | `vkCreateDevice` failed. |
+| `ResourceFailed` | The allocator, command pool and buffers, descriptor pool or sync objects couldn't be made. |
+| `SwapchainFailed` | The first swapchain couldn't be made. |
+
+GPUs are checked in the order of that list, from `NoDiscreteGpu` down. When several GPUs fail for different reasons, the result is the reason of the one that got furthest. For example, if one GPU isn't discrete and another is discrete but lacks a required feature, the result is `MissingFeature`.
+
 ## Picking the GPU and its features
 
-`ContextDesc::pick` is called once for each GPU that has Vulkan `apiVersion` and the queue the game needs (graphics, plus compute unless `computeQueue = false`, plus presenting to the window when there is one). It sees what the GPU supports and fills in what to enable:
+For anything the config can't express (optional features, an extension's own feature struct, properties such as subgroup operations, a score), use `Config::pick`. It is called once for each GPU that meets everything else in the config. It sees what the GPU supports and fills in what to enable:
 
 - `cand.supported`: core features for 1.0 to 1.3 (`core.features`, `v11`, `v12`, `v13`).
 - `cand.hasExtension(name)`, `cand.features<T>(sType)` and `cand.properties<T>(sType)` query a GPU's extensions and their structs.
 - `choice.enable`: the core features to turn on (all off to begin with).
 - `choice.extensions`: device extensions. The swapchain's is added automatically when there's a window.
 - `choice.add<T>(sType)`: an extension's feature struct, chained in after the core ones.
-- `choice.score`: added to the ranking, which is discrete GPUs first, then the most VRAM.
+- `choice.score`: added to the ranking, which is discrete GPUs first (unless `GpuTarget::Any`), then the most VRAM.
+
+The config's required features and extensions are enabled on top of whatever the pick chooses.
 
 Return false with `why` set to pass a GPU over. The reason is logged, and if every GPU is passed over, the final error lists all the reasons.
 
 ```cpp
-// A required extension (FloodSim's float atomics):
-if (!cand.hasExtension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) { why = "no float atomics"; return false; }
-auto& af = choice.add<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>(
+// A required extension's feature struct (FloodSim's float atomics; the
+// extension itself in config.requiredExtensions):
+auto atomics = cand.features<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>(
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT);
-af.shaderBufferFloat32AtomicAdd = VK_TRUE;
-choice.extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+if (!atomics.shaderBufferFloat32AtomicAdd) { why = "no float atomic adds"; return false; }
+choice.add<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>(
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT).shaderBufferFloat32AtomicAdd = VK_TRUE;
 
 // An optional feature (Hexoid's wireframes): enabled where the GPU has it.
 choice.enable.core.features.fillModeNonSolid = cand.supported.core.features.fillModeNonSolid;
@@ -108,4 +153,4 @@ bvk::setLog([](bvk::LogLevel level, std::string_view msg) {
 });
 ```
 
-The validation layer is on in builds without `NDEBUG`, when it's installed (`ContextDesc::validation`). Whether it's active is recorded in `ctx.gpu.validation`.
+The validation layer is on in builds without `NDEBUG`, when it's installed (`Config::validation`). Whether it's active is recorded in `ctx.gpu.validation`.

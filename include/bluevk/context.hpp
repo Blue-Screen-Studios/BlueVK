@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -48,7 +49,7 @@ struct Features {
   void unlink();
 };
 
-// A GPU being considered (ContextDesc::pick): what it is and supports.
+// A GPU being considered (Config::pick): what it is and supports.
 struct DeviceCandidate {
   VkPhysicalDevice phys = VK_NULL_HANDLE;
   VkPhysicalDeviceProperties props{};
@@ -56,7 +57,7 @@ struct DeviceCandidate {
   uint64_t vramBytes = 0;  // its device-local heaps
   Features supported;      // (unlinked)
   std::vector<VkExtensionProperties> extensions;
-  uint32_t apiVersion = 0;  // the context's (ContextDesc::apiVersion)
+  uint32_t apiVersion = 0;  // the context's (Config::apiVersion)
 
   bool hasExtension(const char* name) const;
   // An extension's feature or property struct (its sType given), filled in.
@@ -104,22 +105,70 @@ struct DeviceChoice {
 // `why` logged).
 using DevicePicker = std::function<bool(const DeviceCandidate&, DeviceChoice&, std::string& why)>;
 
-struct ContextDesc {
-  const char* appName = "BlueVK";
+// The engine's name, given to Vulkan for every application (VkApplicationInfo).
+inline constexpr const char* kEngineName = "IBX_BlueVK";
+inline constexpr uint32_t kEngineVersion = VK_MAKE_VERSION(0, 1, 0);  // (BlueVK's)
+
+// Frames the CPU may record ahead of the GPU: each its own command buffer,
+// acquire semaphore and fence (Ctx::frame the one being recorded), and the
+// swapchain at least as many images. Above Single, whatever the game writes
+// per frame it keeps that many of.
+enum class Buffering : uint32_t { Single = 1, Double = 2, Triple = 3 };
+
+// Which GPUs are considered: any (ranked by VRAM, then the game's score),
+// only discrete ones, or discrete ahead of the rest.
+enum class GpuTarget { Any, RequireDiscrete, PreferDiscrete };
+
+// What the context is to be (createContext). The GPU chosen is the best one
+// that meets all of it; what it can't meet comes back as a ContextResult.
+struct Config {
+  std::string appName = "BlueVK App";
   uint32_t appVersion = VK_MAKE_VERSION(0, 1, 0);
   uint32_t apiVersion = VK_API_VERSION_1_3;  // GPUs below it passed over
-  bool computeQueue = true;                  // the one queue does compute too
+  Buffering buffering = Buffering::Single;
+  GpuTarget gpu = GpuTarget::PreferDiscrete;
+  bool computeQueue = true;  // the one queue does compute too
 #ifdef NDEBUG
   bool validation = false;
 #else
   bool validation = true;  // VK_LAYER_KHRONOS_validation, when installed
 #endif
-  DevicePicker pick;  // none: any GPU, nothing optional enabled
+  // Required: a GPU without every feature set here, or every extension
+  // listed, is passed over; the GPU chosen has them all enabled. (Features
+  // of a version above apiVersion: an invalid config.)
+  Features requiredFeatures;
+  std::vector<std::string> requiredExtensions;
+  // The rest (optional features, extensions' own feature structs, a score):
+  // the game's own look at each GPU left. None: nothing more.
+  DevicePicker pick;
   // A descriptor pool shared by the game (Ctx::descPool, allocSet), its sets
   // freeable. None: no pool.
   std::vector<VkDescriptorPoolSize> descriptorPool;
   uint32_t descriptorSets = 0;
 };
+
+// Why a context couldn't be made (createContext), or Ok. For a GPU passed
+// over, the reason of the one that came closest (the later in this list).
+enum class ContextResult {
+  Ok,
+  InvalidConfig,          // the config itself: features above its apiVersion
+  VulkanUnavailable,      // no Vulkan driver (or loader), or none for the window system
+  InstanceFailed,         // vkCreateInstance failed otherwise
+  SurfaceFailed,          // the window's surface couldn't be made
+  NoGpu,                  // no GPU at all
+  NoDiscreteGpu,          // GpuTarget::RequireDiscrete, and none is
+  ApiVersionUnsupported,  // no GPU has the config's apiVersion
+  NoSuitableQueue,        // no queue for graphics (+ compute) (+ presenting)
+  CannotPresent,          // no GPU can present to the window
+  MissingExtension,       // a required extension
+  MissingFeature,         // a required feature
+  BufferingUnsupported,   // the surface can't have as many images as the buffering
+  RejectedByPicker,       // the config's pick turned every GPU left down
+  DeviceFailed,           // vkCreateDevice failed
+  ResourceFailed,         // the allocator, the command pool or buffers, the descriptor pool, sync objects
+  SwapchainFailed,        // the first swapchain couldn't be made
+};
+const char* toString(ContextResult);
 
 // What the GPU chosen is (for a debug screen, a log).
 struct GpuInfo {
@@ -133,7 +182,10 @@ struct GpuInfo {
 
 // ------------------------------------------------------------------ context
 
-// The device, its one queue, the window's swapchain and one frame in flight.
+// The most frames in flight a context may have (Buffering::Triple).
+constexpr uint32_t kMaxFramesInFlight = 3;
+
+// The device, its one queue, the window's swapchain and its frames in flight.
 // A game derives its own from it, adding its render passes and targets.
 struct Ctx {
   VkInstance inst = VK_NULL_HANDLE;
@@ -144,7 +196,7 @@ struct Ctx {
   uint32_t qf = 0;  // the queue family: graphics (+ compute) (+ present)
   VkQueue queue = VK_NULL_HANDLE;
   VmaAllocator vma = VK_NULL_HANDLE;
-  VkDescriptorPool descPool = VK_NULL_HANDLE;  // ContextDesc::descriptorPool's
+  VkDescriptorPool descPool = VK_NULL_HANDLE;  // Config::descriptorPool's
   uint32_t apiVersion = 0;
   VkPhysicalDeviceProperties props{};
   float timestampPeriod = 1.0f;  // ns per timestamp tick
@@ -168,22 +220,32 @@ struct Ctx {
   std::vector<VkImageView> colorViews;
   uint32_t windowW = 0, windowH = 0;  // the window's pixels when it was built
 
-  // One frame in flight: a command buffer, the acquire semaphore, a present
-  // semaphore per swapchain image (indexed by `image`), and the frame fence
-  // (made signaled).
+  // The frames in flight (`framesInFlight` of them): per frame a command
+  // buffer, an acquire semaphore and a fence (made signaled); `frame` is the
+  // one being recorded (advanceFrame moves on). A present semaphore per
+  // swapchain image (indexed by `image`).
   VkCommandPool pool = VK_NULL_HANDLE;
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
-  VkSemaphore acquire = VK_NULL_HANDLE;
+  uint32_t framesInFlight = 1;
+  std::array<VkCommandBuffer, kMaxFramesInFlight> cmds{};
+  std::array<VkSemaphore, kMaxFramesInFlight> acquires{};
+  std::array<VkFence, kMaxFramesInFlight> fences{};
   std::vector<VkSemaphore> present;
-  VkFence fence = VK_NULL_HANDLE;
+  uint32_t frame = 0;
   uint32_t image = 0;
+  VkCommandBuffer cmd() const { return cmds[frame]; }
+  VkSemaphore acquire() const { return acquires[frame]; }
+  VkFence fence() const { return fences[frame]; }
 };
 
-// The instance, the GPU (the best that `desc.pick` accepts), the device and
-// the rest, and with a window (`win`: SDL's, made with SDL_WINDOW_VULKAN)
-// its surface and swapchain. Without one: no surface, no swapchain (compute,
-// tests). False (logged): it couldn't.
-bool createContext(Ctx&, SDL_Window* win, const ContextDesc& desc);
+// On to the next frame in flight (after presenting).
+inline void advanceFrame(Ctx& c) { c.frame = (c.frame + 1) % c.framesInFlight; }
+
+// The instance, the GPU (the best that meets `config`), the device and the
+// rest, and with a window (`win`: SDL's, made with SDL_WINDOW_VULKAN) its
+// surface and swapchain. Without one: no surface, no swapchain (compute,
+// tests). Not Ok: why not (logged; `detail`, when given, the particulars:
+// which GPU lacked what), and the Ctx left as it was made (destroyed).
+ContextResult createContext(Ctx&, SDL_Window* win, const Config& config, std::string* detail = nullptr);
 
 enum class Swapchain { Unchanged, Rebuilt, Failed };
 // Rebuilds the swapchain when the window's pixel size changed (or `force`:

@@ -78,23 +78,104 @@ const char* typeText(VkPhysicalDeviceType t) {
   }
 }
 
+// ------------------------------------------------------------------ features
+
+#include "features.inc"
+
+#define BVK_COUNT(f) +1
+template <class T>
+constexpr bool exactly(size_t first, size_t n) {
+  return sizeof(T) == (first + n * sizeof(VkBool32) + alignof(T) - 1) / alignof(T) * alignof(T);
+}
+static_assert(exactly<VkPhysicalDeviceFeatures>(0, 0 BVK_CORE_FEATURES(BVK_COUNT)), "a core feature unlisted");
+static_assert(exactly<VkPhysicalDeviceVulkan11Features>(offsetof(VkPhysicalDeviceVulkan11Features, storageBuffer16BitAccess),
+                                                        0 BVK_V11_FEATURES(BVK_COUNT)),
+              "a Vulkan 1.1 feature unlisted");
+static_assert(exactly<VkPhysicalDeviceVulkan12Features>(offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge),
+                                                        0 BVK_V12_FEATURES(BVK_COUNT)),
+              "a Vulkan 1.2 feature unlisted");
+static_assert(exactly<VkPhysicalDeviceVulkan13Features>(offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess),
+                                                        0 BVK_V13_FEATURES(BVK_COUNT)),
+              "a Vulkan 1.3 feature unlisted");
+#undef BVK_COUNT
+
+// Calls `f(name, want, has)` for every feature of the four structs.
+template <class F>
+void eachFeature(const Features& want, const Features& has, F&& f) {
+#define BVK_CORE(x) f(#x, want.core.features.x, has.core.features.x);
+#define BVK_V11(x) f("Vulkan 1.1 " #x, want.v11.x, has.v11.x);
+#define BVK_V12(x) f("Vulkan 1.2 " #x, want.v12.x, has.v12.x);
+#define BVK_V13(x) f("Vulkan 1.3 " #x, want.v13.x, has.v13.x);
+  BVK_CORE_FEATURES(BVK_CORE)
+  BVK_V11_FEATURES(BVK_V11)
+  BVK_V12_FEATURES(BVK_V12)
+  BVK_V13_FEATURES(BVK_V13)
+#undef BVK_CORE
+#undef BVK_V11
+#undef BVK_V12
+#undef BVK_V13
+}
+
+// The features wanted that `has` lacks, by name ("" none).
+std::string missingFeatures(const Features& want, const Features& has) {
+  std::string out;
+  eachFeature(want, has, [&](const char* name, VkBool32 w, VkBool32 h) {
+    if (w && !h) out += std::string(out.empty() ? "" : ", ") + name;
+  });
+  return out;
+}
+
+// `from`'s features turned on in `into` too.
+void mergeFeatures(Features& into, const Features& from) {
+#define BVK_CORE(x) into.core.features.x |= from.core.features.x;
+#define BVK_V11(x) into.v11.x |= from.v11.x;
+#define BVK_V12(x) into.v12.x |= from.v12.x;
+#define BVK_V13(x) into.v13.x |= from.v13.x;
+  BVK_CORE_FEATURES(BVK_CORE)
+  BVK_V11_FEATURES(BVK_V11)
+  BVK_V12_FEATURES(BVK_V12)
+  BVK_V13_FEATURES(BVK_V13)
+#undef BVK_CORE
+#undef BVK_V11
+#undef BVK_V12
+#undef BVK_V13
+}
+
+// The config's own sense: its buffering, its features within its version.
+ContextResult checkConfig(const Config& cfg, std::string& why) {
+  const uint32_t frames = uint32_t(cfg.buffering);
+  if (frames < 1 || frames > kMaxFramesInFlight) {
+    why = "buffering " + std::to_string(frames) + " (1 to " + std::to_string(kMaxFramesInFlight) + ")";
+    return ContextResult::InvalidConfig;
+  }
+  // (Features' 1.1 and 1.2 structs are chained from 1.2, its 1.3 one from 1.3.)
+  Features above;
+  if (cfg.apiVersion < VK_API_VERSION_1_2) above.v11 = cfg.requiredFeatures.v11, above.v12 = cfg.requiredFeatures.v12;
+  if (cfg.apiVersion < VK_API_VERSION_1_3) above.v13 = cfg.requiredFeatures.v13;
+  if (const std::string beyond = missingFeatures(above, Features{}); !beyond.empty()) {
+    why = "features above its Vulkan " + versionText(cfg.apiVersion) + " required: " + beyond;
+    return ContextResult::InvalidConfig;
+  }
+  return ContextResult::Ok;
+}
+
 // ------------------------------------------------------------------ instance
 
-bool createInstance(Ctx& c, SDL_Window* win, const ContextDesc& desc) {
+ContextResult createInstance(Ctx& c, SDL_Window* win, const Config& cfg, std::string& why) {
   std::vector<const char*> extensions;
   if (win) {
     uint32_t count = 0;
     const char* const* names = SDL_Vulkan_GetInstanceExtensions(&count);
     if (!names) {
-      die("SDL_Vulkan_GetInstanceExtensions");
-      return false;
+      why = std::string("SDL_Vulkan_GetInstanceExtensions: ") + SDL_GetError();
+      return ContextResult::VulkanUnavailable;
     }
     extensions.assign(names, names + count);
   }
 
   // The validation layer, when asked for and installed.
   std::vector<const char*> layers;
-  if (desc.validation) {
+  if (cfg.validation) {
     uint32_t count = 0;
     vkEnumerateInstanceLayerProperties(&count, nullptr);
     std::vector<VkLayerProperties> available(count);
@@ -111,10 +192,11 @@ bool createInstance(Ctx& c, SDL_Window* win, const ContextDesc& desc) {
 
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-  app.pApplicationName = desc.appName;
-  app.applicationVersion = desc.appVersion;
-  app.pEngineName = "BlueVK";
-  app.apiVersion = desc.apiVersion;
+  app.pApplicationName = cfg.appName.c_str();
+  app.applicationVersion = cfg.appVersion;
+  app.pEngineName = kEngineName;
+  app.engineVersion = kEngineVersion;
+  app.apiVersion = cfg.apiVersion;
 
   VkInstanceCreateInfo ici{};
   ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -127,9 +209,10 @@ bool createInstance(Ctx& c, SDL_Window* win, const ContextDesc& desc) {
   // validated.
   const VkDebugUtilsMessengerCreateInfoEXT debugCi = debugMessengerInfo();
   if (c.gpu.validation) ici.pNext = &debugCi;
-  if (vkCreateInstance(&ici, nullptr, &c.inst) != VK_SUCCESS) {
-    die("vkCreateInstance");
-    return false;
+  if (const VkResult r = vkCreateInstance(&ici, nullptr, &c.inst); r != VK_SUCCESS) {
+    why = "vkCreateInstance: " + std::to_string(int(r));
+    return r == VK_ERROR_INCOMPATIBLE_DRIVER || r == VK_ERROR_INITIALIZATION_FAILED ? ContextResult::VulkanUnavailable
+                                                                                     : ContextResult::InstanceFailed;
   }
   if (c.gpu.validation) {
     auto create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(c.inst, "vkCreateDebugUtilsMessengerEXT");
@@ -138,10 +221,10 @@ bool createInstance(Ctx& c, SDL_Window* win, const ContextDesc& desc) {
   }
 
   if (win && !SDL_Vulkan_CreateSurface(win, c.inst, nullptr, &c.surface)) {
-    die("SDL_Vulkan_CreateSurface");
-    return false;
+    why = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
+    return ContextResult::SurfaceFailed;
   }
-  return true;
+  return ContextResult::Ok;
 }
 
 // ------------------------------------------------------------------ device
@@ -172,36 +255,49 @@ struct Pick {
   int64_t score = -1;
 };
 
-// The GPU: one the game accepts with the queue it needs, discrete ahead of
-// integrated, then the most device-local memory (plus the game's score).
-bool pickDevice(Ctx& c, const ContextDesc& desc, Pick& best) {
+// The GPU: the best that meets the config (its target, version, queue,
+// window, extensions, features, buffering, then its pick), ranked by its
+// target (discrete first, or not), then the most device-local memory (plus
+// the pick's score). None: the reason of the one that came closest.
+ContextResult pickDevice(Ctx& c, const Config& cfg, Pick& best, std::string& reasons) {
   uint32_t count = 0;
   vkEnumeratePhysicalDevices(c.inst, &count, nullptr);
   std::vector<VkPhysicalDevice> devices(count);
   vkEnumeratePhysicalDevices(c.inst, &count, devices.data());
+  if (devices.empty()) {
+    reasons = "no Vulkan GPU found";
+    return ContextResult::NoGpu;
+  }
+  const uint32_t frames = uint32_t(cfg.buffering);
 
-  std::string reasons;
+  ContextResult closest = ContextResult::NoGpu;
   for (VkPhysicalDevice pd : devices) {
     Pick p;
     DeviceCandidate& cand = p.cand;
     cand.phys = pd;
-    cand.apiVersion = desc.apiVersion;
+    cand.apiVersion = cfg.apiVersion;
     vkGetPhysicalDeviceProperties(pd, &cand.props);
     std::string why;
-    auto passOver = [&] {
+    auto passOver = [&](ContextResult r) {
       logf(LogLevel::Info, "GPU {} passed over: {}", cand.props.deviceName, why);
       reasons += std::string(reasons.empty() ? "" : "; ") + cand.props.deviceName + ": " + why;
+      if (int(r) > int(closest)) closest = r;
     };
-    if (cand.props.apiVersion < desc.apiVersion) {
-      why = "Vulkan " + versionText(cand.props.apiVersion) + " (" + versionText(desc.apiVersion) + " needed)";
-      passOver();
+    if (cfg.gpu == GpuTarget::RequireDiscrete && cand.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+      why = std::string("not discrete (") + typeText(cand.props.deviceType) + ")";
+      passOver(ContextResult::NoDiscreteGpu);
       continue;
     }
-    p.qf = pickQueue(pd, c.surface, desc.computeQueue);
+    if (cand.props.apiVersion < cfg.apiVersion) {
+      why = "Vulkan " + versionText(cand.props.apiVersion) + " (" + versionText(cfg.apiVersion) + " needed)";
+      passOver(ContextResult::ApiVersionUnsupported);
+      continue;
+    }
+    p.qf = pickQueue(pd, c.surface, cfg.computeQueue);
     if (p.qf == UINT32_MAX) {
-      why = desc.computeQueue ? "no graphics + compute queue" : "no graphics queue";
+      why = cfg.computeQueue ? "no graphics + compute queue" : "no graphics queue";
       if (c.surface) why += " presenting to the window";
-      passOver();
+      passOver(ContextResult::NoSuitableQueue);
       continue;
     }
 
@@ -215,41 +311,65 @@ bool pickDevice(Ctx& c, const ContextDesc& desc, Pick& best) {
       vkGetPhysicalDeviceSurfacePresentModesKHR(pd, c.surface, &pcount, nullptr);
       if (fcount == 0 || pcount == 0 || !cand.hasExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
         why = "can't present to the window";
-        passOver();
+        passOver(ContextResult::CannotPresent);
         continue;
       }
+    }
+    std::string lacking;
+    for (const std::string& e : cfg.requiredExtensions)
+      if (!cand.hasExtension(e.c_str())) lacking += (lacking.empty() ? "" : ", ") + e;
+    if (!lacking.empty()) {
+      why = "no " + lacking;
+      passOver(ContextResult::MissingExtension);
+      continue;
     }
 
     vkGetPhysicalDeviceMemoryProperties(pd, &cand.memory);
     for (uint32_t hi = 0; hi < cand.memory.memoryHeapCount; ++hi)
       if (cand.memory.memoryHeaps[hi].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
         cand.vramBytes += cand.memory.memoryHeaps[hi].size;
-    vkGetPhysicalDeviceFeatures2(pd, cand.supported.link(desc.apiVersion));
+    vkGetPhysicalDeviceFeatures2(pd, cand.supported.link(cfg.apiVersion));
     cand.supported.unlink();
-
-    if (desc.pick && !desc.pick(cand, p.choice, why)) {
-      passOver();
+    if (const std::string missing = missingFeatures(cfg.requiredFeatures, cand.supported); !missing.empty()) {
+      why = "no " + missing;
+      passOver(ContextResult::MissingFeature);
       continue;
     }
 
-    p.score = 100;
-    if (cand.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-      p.score = 1000000;
-    else if (cand.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
-      p.score = 200;
+    if (c.surface) {
+      VkSurfaceCapabilitiesKHR caps;
+      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, c.surface, &caps);
+      if (caps.maxImageCount > 0 && caps.maxImageCount < frames) {
+        why = "the window's swapchain holds " + std::to_string(caps.maxImageCount) + " images (" +
+              std::to_string(frames) + " needed for its buffering)";
+        passOver(ContextResult::BufferingUnsupported);
+        continue;
+      }
+    }
+
+    if (cfg.pick && !cfg.pick(cand, p.choice, why)) {
+      passOver(ContextResult::RejectedByPicker);
+      continue;
+    }
+    // (What's required, enabled whatever the pick chose.)
+    mergeFeatures(p.choice.enable, cfg.requiredFeatures);
+    for (const std::string& e : cfg.requiredExtensions) p.choice.extensions.push_back(e.c_str());
+
+    // Discrete first (unless any will do); software renderers always last.
+    const VkPhysicalDeviceType type = cand.props.deviceType;
+    const bool hardware = type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                          type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+    p.score = hardware ? 1000000 : 100;
+    if (cfg.gpu != GpuTarget::Any && type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) p.score += 100000000;
     p.score += int64_t(cand.vramBytes / (1024 * 1024)) + p.choice.score;
     if (p.score > best.score) best = std::move(p);
   }
-  if (best.score < 0) {
-    logf(LogLevel::Error, "FAILED: no suitable GPU{}{}", reasons.empty() ? "" : " (", reasons.empty() ? "" : reasons + ")");
-    return false;
-  }
-  return true;
+  return best.score < 0 ? closest : ContextResult::Ok;
 }
 
-bool createDevice(Ctx& c, const ContextDesc& desc) {
+ContextResult createDevice(Ctx& c, const Config& cfg, std::string& why) {
   Pick best;
-  if (!pickDevice(c, desc, best)) return false;
+  if (const ContextResult r = pickDevice(c, cfg, best, why); r != ContextResult::Ok) return r;
   c.phys = best.cand.phys;
   c.qf = best.qf;
   c.props = best.cand.props;
@@ -260,25 +380,26 @@ bool createDevice(Ctx& c, const ContextDesc& desc) {
   c.gpu.type = typeText(c.props.deviceType);
   c.gpu.api = versionText(c.props.apiVersion);
   c.gpu.vramBytes = best.cand.vramBytes;
-  if (desc.apiVersion >= VK_API_VERSION_1_1)
+  if (cfg.apiVersion >= VK_API_VERSION_1_1)
     c.subgroupSize = best.cand
                          .properties<VkPhysicalDeviceSubgroupProperties>(
                              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES)
                          .subgroupSize;
-  if (desc.apiVersion >= VK_API_VERSION_1_2) {
+  if (cfg.apiVersion >= VK_API_VERSION_1_2) {
     const auto driver =
         best.cand.properties<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);
     c.gpu.driver = std::string(driver.driverName) + " " + driver.driverInfo;
   }
 
-  // The extensions: the swapchain's (with a window) and the game's, once each.
+  // The extensions: the swapchain's (with a window), the required ones and
+  // the pick's, once each.
   std::vector<const char*> exts;
   if (c.surface) exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
   for (const char* e : best.choice.extensions)
     if (std::none_of(exts.begin(), exts.end(), [&](const char* x) { return std::strcmp(x, e) == 0; }))
       exts.push_back(e);
 
-  // The features: the core ones, then the game's extension structs.
+  // The features: the core ones, then the pick's extension structs.
   void* tail = nullptr;
   for (auto it = best.choice.chain.rbegin(); it != best.choice.chain.rend(); ++it) {
     auto* s = static_cast<VkBaseOutStructure*>(it->get());
@@ -295,7 +416,7 @@ bool createDevice(Ctx& c, const ContextDesc& desc) {
 
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  dci.pNext = best.choice.enable.link(desc.apiVersion, tail);  // (pEnabledFeatures must then be null)
+  dci.pNext = best.choice.enable.link(cfg.apiVersion, tail);  // (pEnabledFeatures must then be null)
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
@@ -303,8 +424,8 @@ bool createDevice(Ctx& c, const ContextDesc& desc) {
   const VkResult made = vkCreateDevice(c.phys, &dci, nullptr, &c.dev);
   best.choice.enable.unlink();
   if (made != VK_SUCCESS) {
-    die("vkCreateDevice");
-    return false;
+    why = std::string(c.props.deviceName) + ": vkCreateDevice: " + std::to_string(int(made));
+    return ContextResult::DeviceFailed;
   }
   vkGetDeviceQueue(c.dev, c.qf, 0, &c.queue);
   c.enabled = best.choice.enable;
@@ -314,12 +435,12 @@ bool createDevice(Ctx& c, const ContextDesc& desc) {
   ai.instance = c.inst;
   ai.device = c.dev;
   ai.physicalDevice = c.phys;
-  ai.vulkanApiVersion = desc.apiVersion;
-  if (desc.apiVersion >= VK_API_VERSION_1_2 && c.enabled.v12.bufferDeviceAddress)
+  ai.vulkanApiVersion = cfg.apiVersion;
+  if (cfg.apiVersion >= VK_API_VERSION_1_2 && c.enabled.v12.bufferDeviceAddress)
     ai.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
   if (vmaCreateAllocator(&ai, &c.vma) != VK_SUCCESS) {
-    die("vmaCreateAllocator");
-    return false;
+    why = "vmaCreateAllocator";
+    return ContextResult::ResourceFailed;
   }
 
   VkCommandPoolCreateInfo cpi{};
@@ -327,37 +448,47 @@ bool createDevice(Ctx& c, const ContextDesc& desc) {
   cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   cpi.queueFamilyIndex = c.qf;
   if (vkCreateCommandPool(c.dev, &cpi, nullptr, &c.pool) != VK_SUCCESS) {
-    die("vkCreateCommandPool");
-    return false;
+    why = "vkCreateCommandPool";
+    return ContextResult::ResourceFailed;
   }
   VkCommandBufferAllocateInfo cbai{};
   cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   cbai.commandPool = c.pool;
   cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cbai.commandBufferCount = 1;
-  vkAllocateCommandBuffers(c.dev, &cbai, &c.cmd);
+  c.framesInFlight = uint32_t(cfg.buffering);
+  c.frame = 0;
+  cbai.commandBufferCount = c.framesInFlight;
+  if (vkAllocateCommandBuffers(c.dev, &cbai, c.cmds.data()) != VK_SUCCESS) {
+    c.cmds = {};
+    why = "vkAllocateCommandBuffers";
+    return ContextResult::ResourceFailed;
+  }
 
-  if (!desc.descriptorPool.empty()) {
+  if (!cfg.descriptorPool.empty()) {
     VkDescriptorPoolCreateInfo dpi{};
     dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = desc.descriptorSets;
-    dpi.poolSizeCount = static_cast<uint32_t>(desc.descriptorPool.size());
-    dpi.pPoolSizes = desc.descriptorPool.data();
+    dpi.maxSets = cfg.descriptorSets;
+    dpi.poolSizeCount = static_cast<uint32_t>(cfg.descriptorPool.size());
+    dpi.pPoolSizes = cfg.descriptorPool.data();
     if (vkCreateDescriptorPool(c.dev, &dpi, nullptr, &c.descPool) != VK_SUCCESS) {
-      die("vkCreateDescriptorPool");
-      return false;
+      why = "vkCreateDescriptorPool";
+      return ContextResult::ResourceFailed;
     }
   }
 
   VkSemaphoreCreateInfo vsci{};
   vsci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-  vkCreateSemaphore(c.dev, &vsci, nullptr, &c.acquire);
   VkFenceCreateInfo fci{};
   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-  vkCreateFence(c.dev, &fci, nullptr, &c.fence);
-  return true;
+  for (uint32_t f = 0; f < c.framesInFlight; ++f)
+    if (vkCreateSemaphore(c.dev, &vsci, nullptr, &c.acquires[f]) != VK_SUCCESS ||
+        vkCreateFence(c.dev, &fci, nullptr, &c.fences[f]) != VK_SUCCESS) {
+      why = "the frames' semaphores and fences";
+      return ContextResult::ResourceFailed;
+    }
+  return ContextResult::Ok;
 }
 
 // ---------------------------------------------------------------- swapchain
@@ -402,9 +533,10 @@ bool createSwapchain(Ctx& c, SDL_Window* win) {
   extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
   extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
 
-  uint32_t imageCount = caps.minImageCount + 1;
+  // (One more than the least, two at the least, and one a frame in flight.)
+  uint32_t imageCount = std::max({caps.minImageCount + 1, uint32_t(2), c.framesInFlight});
   if (caps.maxImageCount > 0) imageCount = std::min(imageCount, caps.maxImageCount);
-  imageCount = std::max(imageCount, (uint32_t)2);
+  if (imageCount < c.framesInFlight) return false;
 
   VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   for (uint32_t a = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; a; a <<= 1)
@@ -497,10 +629,47 @@ bool Ctx::hasExtension(const char* name) const {
 
 // ------------------------------------------------------------------- context
 
-bool createContext(Ctx& c, SDL_Window* win, const ContextDesc& desc) {
-  c.apiVersion = desc.apiVersion;
-  if (!createInstance(c, win, desc) || !createDevice(c, desc)) return false;
-  return !win || createSwapchain(c, win);
+const char* toString(ContextResult r) {
+  switch (r) {
+    case ContextResult::Ok: return "ok";
+    case ContextResult::InvalidConfig: return "invalid config";
+    case ContextResult::VulkanUnavailable: return "Vulkan unavailable";
+    case ContextResult::InstanceFailed: return "instance creation failed";
+    case ContextResult::SurfaceFailed: return "window surface creation failed";
+    case ContextResult::NoGpu: return "no GPU";
+    case ContextResult::NoDiscreteGpu: return "no discrete GPU";
+    case ContextResult::ApiVersionUnsupported: return "Vulkan version unsupported";
+    case ContextResult::NoSuitableQueue: return "no suitable queue";
+    case ContextResult::CannotPresent: return "can't present to the window";
+    case ContextResult::MissingExtension: return "a required extension is missing";
+    case ContextResult::MissingFeature: return "a required feature is missing";
+    case ContextResult::BufferingUnsupported: return "buffering unsupported";
+    case ContextResult::RejectedByPicker: return "every GPU rejected by the picker";
+    case ContextResult::DeviceFailed: return "device creation failed";
+    case ContextResult::ResourceFailed: return "context resource creation failed";
+    case ContextResult::SwapchainFailed: return "swapchain creation failed";
+  }
+  return "unknown";
+}
+
+ContextResult createContext(Ctx& c, SDL_Window* win, const Config& cfg, std::string* detail) {
+  std::string why;
+  ContextResult r = checkConfig(cfg, why);
+  if (r == ContextResult::Ok) {
+    c.apiVersion = cfg.apiVersion;
+    r = createInstance(c, win, cfg, why);
+  }
+  if (r == ContextResult::Ok) r = createDevice(c, cfg, why);
+  if (r == ContextResult::Ok && win && !createSwapchain(c, win)) {
+    why = "the window's first swapchain";
+    r = ContextResult::SwapchainFailed;
+  }
+  if (r != ContextResult::Ok) {
+    logf(LogLevel::Error, "FAILED: {}{}{}", toString(r), why.empty() ? "" : ": ", why);
+    destroyContext(c);
+  }
+  if (detail) *detail = why;
+  return r;
 }
 
 Swapchain ensureSwapchain(Ctx& c, SDL_Window* win, bool force) {
@@ -518,11 +687,13 @@ void destroyContext(Ctx& c) {
     for (VkImageView v : c.colorViews) vkDestroyImageView(c.dev, v, nullptr);
     if (c.swapchain) vkDestroySwapchainKHR(c.dev, c.swapchain, nullptr);
     if (c.descPool) vkDestroyDescriptorPool(c.dev, c.descPool, nullptr);
-    if (c.cmd) vkFreeCommandBuffers(c.dev, c.pool, 1, &c.cmd);
+    if (c.cmds[0]) vkFreeCommandBuffers(c.dev, c.pool, c.framesInFlight, c.cmds.data());
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
-    if (c.acquire) vkDestroySemaphore(c.dev, c.acquire, nullptr);
+    for (VkSemaphore s : c.acquires)
+      if (s) vkDestroySemaphore(c.dev, s, nullptr);
     for (VkSemaphore s : c.present) vkDestroySemaphore(c.dev, s, nullptr);
-    if (c.fence) vkDestroyFence(c.dev, c.fence, nullptr);
+    for (VkFence f : c.fences)
+      if (f) vkDestroyFence(c.dev, f, nullptr);
     if (c.vma) vmaDestroyAllocator(c.vma);
     vkDestroyDevice(c.dev, nullptr);
   }
